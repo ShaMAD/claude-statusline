@@ -107,6 +107,46 @@ iso_to_epoch() {
     return 1
 }
 
+skill_names_file="/tmp/claude/statusline-skill-names.txt"
+skill_names_max_age=300
+skill_names=""
+
+# Index every installed skill and plugin command name. Layouts vary (plain
+# skills, plugin skills under cache/<plugin>/<version>/, external_plugins, and
+# command-style skills defined as commands/<name>.md), so index by discovery
+# rather than by hardcoded paths. Cached because it costs a filesystem walk.
+load_skill_names() {
+    local age=999999 mtime now
+    if [ -f "$skill_names_file" ]; then
+        mtime=$(stat -c %Y "$skill_names_file" 2>/dev/null || stat -f %m "$skill_names_file" 2>/dev/null)
+        if [ -n "$mtime" ]; then
+            now=$(date +%s)
+            age=$(( now - mtime ))
+        fi
+    fi
+    if [ "$age" -lt "$skill_names_max_age" ]; then
+        skill_names=$(<"$skill_names_file")
+        return 0
+    fi
+
+    {
+        find "$HOME/.claude/skills" "$cwd/.claude/skills" -maxdepth 2 -name "SKILL.md" 2>/dev/null
+        find "$HOME/.claude/commands" "$cwd/.claude/commands" -maxdepth 2 -name "*.md" 2>/dev/null
+        find "$HOME/.claude/plugins" -maxdepth 8 \
+             \( -name "SKILL.md" -o -path "*/commands/*.md" \) 2>/dev/null
+    } | sed 's|/SKILL\.md$||; s|\.md$||; s|.*/||' | sort -u > "$skill_names_file" 2>/dev/null
+    skill_names=$(<"$skill_names_file")
+}
+
+skill_exists() {
+    local n="${1##*:}"
+    [ -n "$n" ] || return 1
+    case $'\n'"$skill_names"$'\n' in
+        *$'\n'"$n"$'\n'*) return 0 ;;
+    esac
+    return 1
+}
+
 # ── Extract JSON data ───────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 
@@ -126,11 +166,61 @@ fi
 
 effort=$(echo "$input" | jq -r '.effort.level // empty')
 
-# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
+# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort │ Skill ──
 pct_color=$(color_for_pct "$pct_used")
 cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
+
+# ── Current skill (from transcript, sticky per session) ─
+skill=""
+IFS=$'\t' read -r transcript session_id < <(echo "$input" | jq -r '[.transcript_path // "", .session_id // ""] | @tsv')
+skill_cache="/tmp/claude/skill-${session_id:-unknown}"
+skill_names_loaded=false
+mkdir -p /tmp/claude 2>/dev/null
+
+# Pre-filter with grep: transcript lines can be 100KB+, and bash pattern
+# matching over all of them costs far more than the whole rest of the script.
+# Slash commands are matched as "content":"<command-name>/ so that the marker
+# has to open a content field; the same text quoted inside a tool call is
+# backslash-escaped in the transcript and correctly ignored.
+skill_lines=""
+if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+    skill_lines=$(tail -n 400 "$transcript" 2>/dev/null \
+        | grep -E '"name":"Skill"|"content":"<command-name>/' 2>/dev/null)
+fi
+
+if [ -n "$skill_lines" ]; then
+    while IFS= read -r line; do
+        case "$line" in
+            *'"name":"Skill"'*)
+                found_skill=$(printf '%s' "$line" | jq -r '
+                    select(.isSidechain != true)
+                    | [ .message.content[]?
+                        | select(.type == "tool_use" and .name == "Skill")
+                        | .input.skill ] | last // empty' 2>/dev/null)
+                [ -n "$found_skill" ] && skill="$found_skill"
+                ;;
+            *'"content":"<command-name>/'*)
+                if ! $skill_names_loaded; then
+                    load_skill_names
+                    skill_names_loaded=true
+                fi
+                found_skill="${line#*'"content":"<command-name>/'}"
+                found_skill="${found_skill%%<*}"
+                if [ -n "$found_skill" ] && skill_exists "$found_skill"; then
+                    skill="$found_skill"
+                fi
+                ;;
+        esac
+    done <<< "$skill_lines"
+fi
+
+if [ -n "$skill" ]; then
+    printf '%s\n' "$skill" > "$skill_cache" 2>/dev/null
+elif [ -f "$skill_cache" ]; then
+    skill=$(<"$skill_cache")
+fi
 
 git_branch=""
 git_dirty=""
@@ -185,6 +275,12 @@ if [ -n "$effort" ]; then
         *)              line1+="${dim}◑ ${effort}${reset}" ;;
     esac
 fi
+if [ -n "$skill" ]; then
+    skill_disp="$skill"
+    [ ${#skill_disp} -gt 24 ] && skill_disp="${skill_disp:0:23}…"
+    line1+="${sep}"
+    line1+="${orange}✦ ${skill_disp}${reset}"
+fi
 
 # ── Rate limits from stdin (primary) ───────────────────
 has_stdin_rates=false
@@ -205,7 +301,6 @@ fi
 # ── Fallback: API call (cached) ────────────────────────
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
-mkdir -p /tmp/claude
 
 usage_data=""
 extra_enabled="false"

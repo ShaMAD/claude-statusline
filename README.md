@@ -1,6 +1,6 @@
 # claude-statusline
 
-Configure your Claude Code statusline to show limits, directory and git info
+Configure your Claude Code statusline to show limits, directory, git info, reasoning effort and the current skill
 
 ![demo](./.github/demo.png)
 
