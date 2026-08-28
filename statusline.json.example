@@ -1,0 +1,4 @@
+{
+  "blocks": ["model","context","directory","skills","effort","current","weekly"],
+  "skills_limit": 3
+}
