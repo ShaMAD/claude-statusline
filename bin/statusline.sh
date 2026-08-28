@@ -170,6 +170,23 @@ parse_usage_data() {
     [ "$u_ok" = "ok" ]
 }
 
+# Keep first-invocation order, drop duplicates, and cap the list so a very
+# long session cannot grow the cache without bound.
+remember_skill() {
+    local n="$1" count
+    [ -n "$n" ] || return 0
+    case ",$skills_seen," in *",$n,"*) return 0 ;; esac
+    if [ -z "$skills_seen" ]; then
+        skills_seen="$n"
+    else
+        skills_seen="$skills_seen,$n"
+    fi
+    count=${skills_seen//[!,]/}
+    if [ ${#count} -ge 40 ]; then
+        skills_seen="${skills_seen#*,}"
+    fi
+}
+
 skill_exists() {
     local n="${1##*:}"
     [ -n "$n" ] || return 1
@@ -226,53 +243,117 @@ pct_color=$(color_for_pct "$pct_used")
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
 
-# ── Current skill (from transcript, sticky per session) ─
-skill=""
-skill_cache="/tmp/claude/skill-${session_id:-unknown}"
+# ── Current skills (from transcript, incremental) ───────
+# Off unless asked for, so upgrading changes nobody's status line. Both
+# shapes are accepted: {"skills": true} and the {"blocks": [... "skills"]}
+# form used by mpiton/claude-statusline, so a config written for either works.
+skills_enabled=false
+skills_limit=3
+skills_config="$HOME/.claude/statusline.json"
+if [ -f "$skills_config" ]; then
+    {
+        read -r cfg_skills
+        read -r cfg_limit
+    } < <(jq -r '
+        (((.skills // false) == true) or ((.blocks // []) | index("skills") != null) | tostring),
+        (.skills_limit // 3 | if type == "number" and . >= 1 and . <= 10 then floor else 3 end)
+    ' "$skills_config" 2>/dev/null)
+    [ "$cfg_skills" = "true" ] && skills_enabled=true
+    case "$cfg_limit" in ''|*[!0-9]*) : ;; *) skills_limit=$cfg_limit ;; esac
+fi
+
+skills_seen=""
 skill_names_loaded=false
-mkdir -p /tmp/claude 2>/dev/null
 
-# Pre-filter with grep: transcript lines can be 100KB+, and bash pattern
-# matching over all of them costs far more than the whole rest of the script.
-# Slash commands are matched as "content":"<command-name>/ so that the marker
-# has to open a content field; the same text quoted inside a tool call is
-# backslash-escaped in the transcript and correctly ignored.
-skill_lines=""
-if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-    skill_lines=$(tail -n 400 "$transcript" 2>/dev/null \
-        | grep -E '"name":"Skill"|"content":"<command-name>/' 2>/dev/null)
-fi
+# Only the bytes appended since the last render are read, so the cost does
+# not grow with the session. The cache holds that byte offset and the names
+# found so far. awk does the byte accounting and pre-filters, since transcript
+# lines run to 100KB+ and bash pattern matching over all of them costs more
+# than the whole rest of the script.
+if $skills_enabled && [ -n "$transcript" ] && [ -f "$transcript" ]; then
+    mkdir -p /tmp/claude 2>/dev/null
+    skills_cache="/tmp/claude/skills-${session_id:-unknown}"
+    skills_offset=0
 
-if [ -n "$skill_lines" ]; then
-    while IFS= read -r line; do
-        case "$line" in
-            *'"name":"Skill"'*)
-                found_skill=$(printf '%s' "$line" | jq -r '
-                    select(.isSidechain != true)
-                    | [ .message.content[]?
-                        | select(.type == "tool_use" and .name == "Skill")
-                        | .input.skill ] | last // empty' 2>/dev/null)
-                [ -n "$found_skill" ] && skill="$found_skill"
-                ;;
-            *'"content":"<command-name>/'*)
-                if ! $skill_names_loaded; then
-                    load_skill_names
-                    skill_names_loaded=true
-                fi
-                found_skill="${line#*'"content":"<command-name>/'}"
-                found_skill="${found_skill%%<*}"
-                if [ -n "$found_skill" ] && skill_exists "$found_skill"; then
-                    skill="$found_skill"
-                fi
-                ;;
-        esac
-    done <<< "$skill_lines"
-fi
+    if [ -f "$skills_cache" ] && [ ! -L "$skills_cache" ]; then
+        IFS=$'\t' read -r cached_offset skills_seen < "$skills_cache"
+        case "$cached_offset" in ''|*[!0-9]*) cached_offset=0 ;; esac
+        skills_offset=$cached_offset
+    fi
 
-if [ -n "$skill" ]; then
-    printf '%s\n' "$skill" > "$skill_cache" 2>/dev/null
-elif [ -f "$skill_cache" ]; then
-    skill=$(<"$skill_cache")
+    skills_size=$(stat -c %s "$transcript" 2>/dev/null || stat -f %z "$transcript" 2>/dev/null)
+    case "$skills_size" in ''|*[!0-9]*) skills_size=0 ;; esac
+
+    # Transcript replaced or truncated: what the offset pointed at is gone.
+    if [ "$skills_size" -lt "$skills_offset" ]; then
+        skills_offset=0
+        skills_seen=""
+    fi
+
+    if [ "$skills_size" -gt "$skills_offset" ]; then
+        while IFS= read -r scanned; do
+            case "$scanned" in
+                B*)
+                    skills_offset=$(( skills_offset + ${scanned#B} ))
+                    ;;
+                L*)
+                    line=${scanned#L}
+                    case "$line" in
+                        *'"name":"Skill"'*)
+                            # jq rather than a regex over the raw line: the
+                            # extraction must not depend on JSON key order.
+                            while IFS= read -r found_skill; do
+                                remember_skill "$found_skill"
+                            done < <(printf '%s' "$line" | jq -r '
+                                select(.isSidechain != true)
+                                | .message.content[]?
+                                | select(.type == "tool_use" and .name == "Skill")
+                                | .input.skill // empty' 2>/dev/null)
+                            ;;
+                    esac
+                    case "$line" in
+                        *'"content":"<command-name>/'*)
+                            if ! $skill_names_loaded; then
+                                load_skill_names
+                                skill_names_loaded=true
+                            fi
+                            found_skill="${line#*'"content":"<command-name>/'}"
+                            found_skill="${found_skill%%<*}"
+                            if [ -n "$found_skill" ] && skill_exists "$found_skill"; then
+                                remember_skill "$found_skill"
+                            fi
+                            ;;
+                    esac
+                    ;;
+            esac
+        done < <(tail -c "+$(( skills_offset + 1 ))" "$transcript" 2>/dev/null \
+            | awk -v chunk="$(( skills_size - skills_offset ))" '
+                function flush() { if (pending != "") { print pending; pending = "" } }
+                {
+                    # Flushing the previous record here keeps the final one
+                    # pending until END, where we know whether it was complete.
+                    flush()
+                    lastlen = length($0) + 1
+                    total += lastlen
+                    if ($0 ~ /"name":"Skill"/ || $0 ~ /"content":"<command-name>\//) pending = "L" $0
+                }
+                END {
+                    # A trailing newline the last record never had shows up as
+                    # total overshooting the chunk: that record is half-written,
+                    # so neither its matches nor its bytes are consumed.
+                    if (total <= chunk) {
+                        flush()
+                        print "B" total
+                    } else {
+                        print "B" (total - lastlen)
+                    }
+                }
+            ')
+
+        if [ ! -L "$skills_cache" ]; then
+            printf '%s\t%s\n' "$skills_offset" "$skills_seen" > "$skills_cache" 2>/dev/null
+        fi
+    fi
 fi
 
 git_branch=""
@@ -329,11 +410,21 @@ if [ -n "$effort" ]; then
         *)      line1+="${dim}◌ ${effort}${reset}" ;;
     esac
 fi
-if [ -n "$skill" ]; then
-    skill_disp="$skill"
-    [ ${#skill_disp} -gt 24 ] && skill_disp="${skill_disp:0:23}…"
+if [ -n "$skills_seen" ]; then
+    IFS=',' read -r -a skills_list <<< "$skills_seen"
+    skills_total=${#skills_list[@]}
+    skills_from=0
+    [ "$skills_total" -gt "$skills_limit" ] && skills_from=$(( skills_total - skills_limit ))
+
+    skills_disp=""
+    for (( i = skills_from; i < skills_total; i++ )); do
+        [ -n "$skills_disp" ] && skills_disp+=","
+        skills_disp+="${skills_list[i]}"
+    done
+    [ "$skills_from" -gt 0 ] && skills_disp+=" ${dim}+${skills_from}${reset}${orange}"
+
     line1+="${sep}"
-    line1+="${orange}✦ ${skill_disp}${reset}"
+    line1+="${orange}✦ ${skills_disp}${reset}"
 fi
 
 # ── Rate limits from stdin (primary) ───────────────────
