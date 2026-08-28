@@ -269,10 +269,12 @@ fi
 if [ -n "$effort" ]; then
     line1+="${sep}"
     case "$effort" in
-        max|xhigh|high) line1+="${magenta}● ${effort}${reset}" ;;
-        medium)         line1+="${dim}◑ ${effort}${reset}" ;;
-        low)            line1+="${dim}◔ ${effort}${reset}" ;;
-        *)              line1+="${dim}◑ ${effort}${reset}" ;;
+        low)    line1+="${dim}○ ${effort}${reset}" ;;
+        medium) line1+="${dim}◔ ${effort}${reset}" ;;
+        high)   line1+="${magenta}◑ ${effort}${reset}" ;;
+        xhigh)  line1+="${magenta}◕ ${effort}${reset}" ;;
+        max)    line1+="${magenta}● ${effort}${reset}" ;;
+        *)      line1+="${dim}◌ ${effort}${reset}" ;;
     esac
 fi
 if [ -n "$skill" ]; then
