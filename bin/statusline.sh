@@ -138,6 +138,38 @@ load_skill_names() {
     skill_names=$(<"$skill_names_file")
 }
 
+# Same one-pass reasoning as the stdin read, for the usage API payload.
+# Returns non-zero when the payload is absent or does not carry a five_hour
+# object, which also replaces the separate `jq -e` validity checks.
+parse_usage_data() {
+    u_ok=""; u_five_pct=""; u_five_reset_iso=""; u_seven_pct=""
+    u_seven_reset_iso=""; u_extra_enabled="false"
+    u_extra_pct=""; u_extra_used=""; u_extra_limit=""
+    [ -n "$1" ] || return 1
+    {
+        read -r u_ok
+        read -r u_five_pct
+        read -r u_five_reset_iso
+        read -r u_seven_pct
+        read -r u_seven_reset_iso
+        read -r u_extra_enabled
+        read -r u_extra_pct
+        read -r u_extra_used
+        read -r u_extra_limit
+    } < <(printf '%s' "$1" | jq -r '
+        (if (.five_hour | type) == "object" then "ok" else "" end),
+        (.five_hour.utilization // 0 | round),
+        (.five_hour.resets_at // ""),
+        (.seven_day.utilization // 0 | round),
+        (.seven_day.resets_at // ""),
+        (.extra_usage.is_enabled // false),
+        (.extra_usage.utilization // 0 | round),
+        (.extra_usage.used_credits // 0 | round),
+        (.extra_usage.monthly_limit // 0 | round)
+    ' 2>/dev/null)
+    [ "$u_ok" = "ok" ]
+}
+
 skill_exists() {
     local n="${1##*:}"
     [ -n "$n" ] || return 1
@@ -148,33 +180,54 @@ skill_exists() {
 }
 
 # ── Extract JSON data ───────────────────────────────────
-model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
+# One jq pass for everything on stdin. The script reruns on every assistant
+# message, and each extra process costs more than the parsing itself. Fields
+# come out one per line, in the same order they are read below — keep the two
+# lists in sync. `// ""` rather than `// empty`, so a missing field still
+# emits its line and the rest do not shift up.
+{
+    read -r model_name
+    read -r size
+    read -r current
+    read -r effort
+    read -r cwd
+    read -r transcript
+    read -r session_id
+    read -r session_start
+    read -r stdin_five_pct
+    read -r stdin_five_reset
+    read -r stdin_seven_pct
+    read -r stdin_seven_reset
+} < <(echo "$input" | jq -r '
+    (.model.display_name // "Claude"),
+    (.context_window.context_window_size // 200000),
+    ((.context_window.current_usage.input_tokens // 0)
+     + (.context_window.current_usage.cache_creation_input_tokens // 0)
+     + (.context_window.current_usage.cache_read_input_tokens // 0)),
+    (.effort.level // ""),
+    (.cwd // ""),
+    (.transcript_path // ""),
+    (.session_id // ""),
+    (.session.start_time // ""),
+    (.rate_limits.five_hour.used_percentage // "" | if . == "" then "" else round end),
+    (.rate_limits.five_hour.resets_at // ""),
+    (.rate_limits.seven_day.used_percentage // "" | if . == "" then "" else round end),
+    (.rate_limits.seven_day.resets_at // "")
+' 2>/dev/null)
 
-size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
-[ "$size" -eq 0 ] 2>/dev/null && size=200000
+[ -n "$model_name" ] || model_name="Claude"
+case "$size" in ''|*[!0-9]*) size=200000 ;; esac
+[ "$size" -eq 0 ] && size=200000
 
-input_tokens=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
-cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
-current=$(( input_tokens + cache_create + cache_read ))
-
-if [ "$size" -gt 0 ]; then
-    pct_used=$(( current * 100 / size ))
-else
-    pct_used=0
-fi
-
-effort=$(echo "$input" | jq -r '.effort.level // empty')
+pct_used=$(( current * 100 / size ))
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort │ Skill ──
 pct_color=$(color_for_pct "$pct_used")
-cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
 
 # ── Current skill (from transcript, sticky per session) ─
 skill=""
-IFS=$'\t' read -r transcript session_id < <(echo "$input" | jq -r '[.transcript_path // "", .session_id // ""] | @tsv')
 skill_cache="/tmp/claude/skill-${session_id:-unknown}"
 skill_names_loaded=false
 mkdir -p /tmp/claude 2>/dev/null
@@ -232,7 +285,6 @@ if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 session_duration=""
-session_start=$(echo "$input" | jq -r '.session.start_time // empty')
 if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
     start_epoch=$(iso_to_epoch "$session_start")
     if [ -n "$start_epoch" ]; then
@@ -291,13 +343,12 @@ five_hour_reset_epoch=""
 seven_day_pct=""
 seven_day_reset_epoch=""
 
-stdin_five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 if [ -n "$stdin_five_pct" ]; then
     has_stdin_rates=true
-    five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
-    five_hour_reset_epoch=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-    seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
-    seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
+    five_hour_pct="$stdin_five_pct"
+    five_hour_reset_epoch="$stdin_five_reset"
+    seven_day_pct="$stdin_seven_pct"
+    seven_day_reset_epoch="$stdin_seven_reset"
 fi
 
 # ── Fallback: API call (cached) ────────────────────────
@@ -353,31 +404,28 @@ if ! $has_stdin_rates; then
                 -H "anthropic-beta: oauth-2025-04-20" \
                 -H "User-Agent: claude-code/2.1.34" \
                 "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-            if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
+            if parse_usage_data "$response"; then
                 usage_data="$response"
                 echo "$response" > "$cache_file"
             fi
         fi
         if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
-            usage_data=$(cat "$cache_file" 2>/dev/null)
+            usage_data=$(<"$cache_file")
         fi
     fi
 
-    if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-        five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-        five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
-        five_hour_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
-        seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
-        seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
-        seven_day_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
-
-        extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
+    if parse_usage_data "$usage_data"; then
+        five_hour_pct="$u_five_pct"
+        five_hour_reset_epoch=$(iso_to_epoch "$u_five_reset_iso")
+        seven_day_pct="$u_seven_pct"
+        seven_day_reset_epoch=$(iso_to_epoch "$u_seven_reset_iso")
+        extra_enabled="$u_extra_enabled"
     fi
 else
     if [ -f "$cache_file" ]; then
-        usage_data=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-            extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
+        usage_data=$(<"$cache_file")
+        if parse_usage_data "$usage_data"; then
+            extra_enabled="$u_extra_enabled"
         fi
     fi
 fi
@@ -408,9 +456,9 @@ if [ -n "$seven_day_pct" ]; then
 fi
 
 if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
-    extra_pct=$(echo "$usage_data" | jq -r '.extra_usage.utilization // 0' | awk '{printf "%.0f", $1}')
-    extra_used=$(echo "$usage_data" | jq -r '.extra_usage.used_credits // 0' | awk '{printf "%.2f", $1/100}')
-    extra_limit=$(echo "$usage_data" | jq -r '.extra_usage.monthly_limit // 0' | awk '{printf "%.2f", $1/100}')
+    extra_pct="$u_extra_pct"
+    printf -v extra_used '%d.%02d' "$(( u_extra_used / 100 ))" "$(( u_extra_used % 100 ))"
+    printf -v extra_limit '%d.%02d' "$(( u_extra_limit / 100 ))" "$(( u_extra_limit % 100 ))"
     extra_bar=$(build_bar "$extra_pct" "$bar_width")
     extra_pct_color=$(color_for_pct "$extra_pct")
 
