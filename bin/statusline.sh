@@ -227,9 +227,9 @@ skill_exists() {
     (.session_id // ""),
     (.session.start_time // ""),
     (.rate_limits.five_hour.used_percentage // "" | if . == "" then "" else round end),
-    (.rate_limits.five_hour.resets_at // ""),
+    (.rate_limits.five_hour.resets_at // "" | if type == "number" then floor else "" end),
     (.rate_limits.seven_day.used_percentage // "" | if . == "" then "" else round end),
-    (.rate_limits.seven_day.resets_at // "")
+    (.rate_limits.seven_day.resets_at // "" | if type == "number" then floor else "" end)
 ' 2>/dev/null)
 
 [ -n "$model_name" ] || model_name="Claude"
@@ -425,99 +425,120 @@ if [ -n "$skills_seen" ]; then
     line1+="${orange}✦ ${skills_disp}${reset}"
 fi
 
-# ── Rate limits from stdin (primary) ───────────────────
-has_stdin_rates=false
-five_hour_pct=""
-five_hour_reset_epoch=""
-seven_day_pct=""
-seven_day_reset_epoch=""
-
-if [ -n "$stdin_five_pct" ]; then
-    has_stdin_rates=true
-    five_hour_pct="$stdin_five_pct"
-    five_hour_reset_epoch="$stdin_five_reset"
-    seven_day_pct="$stdin_seven_pct"
-    seven_day_reset_epoch="$stdin_seven_reset"
-fi
-
-# ── Fallback: API call (cached) ────────────────────────
+# ── Usage API (cached) ─────────────────────────────────
+# Queried even when stdin carries rate_limits. stdin is only as fresh as the
+# main conversation's last API response, so it stands still while subagents
+# or other sessions spend the same account. The endpoint reports the account
+# as a whole. The cache is shared by every session, so the endpoint is asked
+# at most once per cache_max_age however many sessions render.
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
 
 usage_data=""
 extra_enabled="false"
+now=$(date +%s)
+needs_refresh=true
 
-if ! $has_stdin_rates; then
-    needs_refresh=true
+if [ -f "$cache_file" ]; then
+    cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
+    case "$cache_mtime" in ''|*[!0-9]*) cache_mtime=0 ;; esac
+    if [ $(( now - cache_mtime )) -lt "$cache_max_age" ]; then
+        needs_refresh=false
+        usage_data=$(<"$cache_file")
+    fi
+fi
 
-    if [ -f "$cache_file" ]; then
-        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
-        now=$(date +%s)
-        cache_age=$(( now - cache_mtime ))
-        if [ "$cache_age" -lt "$cache_max_age" ]; then
-            needs_refresh=false
-            usage_data=$(cat "$cache_file" 2>/dev/null)
+if $needs_refresh; then
+    token=""
+    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        token="$CLAUDE_CODE_OAUTH_TOKEN"
+    elif command -v security >/dev/null 2>&1; then
+        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        if [ -n "$blob" ]; then
+            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
         fi
     fi
-
-    if $needs_refresh; then
-        token=""
-        if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            token="$CLAUDE_CODE_OAUTH_TOKEN"
-        elif command -v security >/dev/null 2>&1; then
-            blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        creds_file="${HOME}/.claude/.credentials.json"
+        if [ -f "$creds_file" ]; then
+            token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+        fi
+    fi
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        if command -v secret-tool >/dev/null 2>&1; then
+            blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
             if [ -n "$blob" ]; then
                 token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
             fi
         fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            creds_file="${HOME}/.claude/.credentials.json"
-            if [ -f "$creds_file" ]; then
-                token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-            fi
-        fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            if command -v secret-tool >/dev/null 2>&1; then
-                blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
-                if [ -n "$blob" ]; then
-                    token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-                fi
-            fi
-        fi
-
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            response=$(curl -s --max-time 5 \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $token" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.1.34" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-            if parse_usage_data "$response"; then
-                usage_data="$response"
-                echo "$response" > "$cache_file"
-            fi
-        fi
-        if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
-            usage_data=$(<"$cache_file")
-        fi
     fi
 
-    if parse_usage_data "$usage_data"; then
-        five_hour_pct="$u_five_pct"
-        five_hour_reset_epoch=$(iso_to_epoch "$u_five_reset_iso")
-        seven_day_pct="$u_seven_pct"
-        seven_day_reset_epoch=$(iso_to_epoch "$u_seven_reset_iso")
-        extra_enabled="$u_extra_enabled"
+    if [ -n "$token" ] && [ "$token" != "null" ]; then
+        response=$(curl -s --max-time 5 \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+        if parse_usage_data "$response"; then
+            usage_data="$response"
+            # Written whole and renamed, so a session rendering at the same
+            # moment never reads a half-written file.
+            mkdir -p /tmp/claude 2>/dev/null
+            printf '%s\n' "$response" > "$cache_file.$$" 2>/dev/null \
+                && mv -f "$cache_file.$$" "$cache_file" 2>/dev/null
+        elif [ -f "$cache_file" ]; then
+            # A failed request is not retried on every render: each attempt
+            # can hold the render for the whole --max-time. Marking the old
+            # data fresh is safe, since it is only ever combined with stdin
+            # by taking the higher reading of a window that has not reset.
+            touch "$cache_file" 2>/dev/null
+        fi
     fi
-else
-    if [ -f "$cache_file" ]; then
+    if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
         usage_data=$(<"$cache_file")
-        if parse_usage_data "$usage_data"; then
-            extra_enabled="$u_extra_enabled"
-        fi
     fi
 fi
+
+api_five_pct=""; api_five_reset=""; api_seven_pct=""; api_seven_reset=""
+if parse_usage_data "$usage_data"; then
+    api_five_pct="$u_five_pct"
+    api_five_reset=$(iso_to_epoch "$u_five_reset_iso")
+    api_seven_pct="$u_seven_pct"
+    api_seven_reset=$(iso_to_epoch "$u_seven_reset_iso")
+    extra_enabled="$u_extra_enabled"
+fi
+
+# Two readings of one window, one from stdin and one from the API. A reading
+# whose window has already reset is dropped. Of two readings of the same
+# window the higher one wins, since usage only grows until the reset. If they
+# belong to different windows, the later one is the current window.
+pick_window() {
+    local a_pct=$1 a_reset=$2 b_pct=$3 b_reset=$4 slack=600
+    case "$a_reset" in ''|*[!0-9]*) a_reset=0 ;; esac
+    case "$b_reset" in ''|*[!0-9]*) b_reset=0 ;; esac
+    case "$a_pct" in ''|*[!0-9]*) a_pct="" ;; esac
+    case "$b_pct" in ''|*[!0-9]*) b_pct="" ;; esac
+    [ "$a_reset" -gt 0 ] && [ "$a_reset" -le "$now" ] && a_pct=""
+    [ "$b_reset" -gt 0 ] && [ "$b_reset" -le "$now" ] && b_pct=""
+
+    win_pct="$a_pct"; win_reset="$a_reset"
+    if [ -n "$b_pct" ]; then
+        if [ -z "$a_pct" ] || [ "$b_reset" -gt $(( a_reset + slack )) ]; then
+            win_pct="$b_pct"; win_reset="$b_reset"
+        elif [ "$a_reset" -le $(( b_reset + slack )) ] && [ "$b_pct" -gt "$a_pct" ]; then
+            win_pct="$b_pct"
+        fi
+        [ "$win_reset" -gt 0 ] || win_reset="$b_reset"
+    fi
+    [ "$win_reset" -gt 0 ] || win_reset=""
+}
+
+pick_window "$stdin_five_pct" "$stdin_five_reset" "$api_five_pct" "$api_five_reset"
+five_hour_pct="$win_pct"; five_hour_reset_epoch="$win_reset"
+pick_window "$stdin_seven_pct" "$stdin_seven_reset" "$api_seven_pct" "$api_seven_reset"
+seven_day_pct="$win_pct"; seven_day_reset_epoch="$win_reset"
 
 # ── Rate limit lines ────────────────────────────────────
 rate_lines=""

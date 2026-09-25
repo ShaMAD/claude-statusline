@@ -14,6 +14,13 @@ npx @kamranahmedse/claude-statusline
 
 It backups your old status line if any and copies the status line script to `~/.claude/statusline.sh` and configures your Claude Code settings.
 
+The settings entry includes `"refreshInterval": 30`. Claude Code reruns the
+script on its own only when the main session has news, so without a timer the
+limits stand still while the session waits on subagents. The limits come from
+the usage endpoint as well as from Claude Code, since the endpoint counts
+every session and subagent on the account. It is asked at most once a minute,
+shared by all sessions.
+
 ## Skills block
 
 Off unless you ask for it, so upgrading does not change your status line.
