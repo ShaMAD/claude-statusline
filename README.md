@@ -27,7 +27,7 @@ Create `~/.claude/statusline.json`:
 ```
 
 ```
-Opus │ ✍️ 25% │ my-repo (main) │ ● xhigh │ ✦ code-review,artifact-design,dataviz +2
+Opus │ ✎ 25% │ my-repo (main) │ ● xhigh │ ✦ code-review,artifact-design,dataviz +2
 ```
 
 `skills_limit` is how many names are shown, 1 to 10, 3 by default; the rest
