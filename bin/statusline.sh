@@ -139,8 +139,10 @@ load_skill_names() {
 }
 
 # Same one-pass reasoning as the stdin read, for the usage API payload.
-# Returns non-zero when the payload is absent or does not carry a five_hour
-# object, which also replaces the separate `jq -e` validity checks.
+# Returns non-zero when the payload is absent or carries neither window, which
+# also replaces the separate `jq -e` validity checks. A window that is present
+# but null reads as 0% with no reset time: between a reset and the first use
+# of the next window there is no window, and nothing has been used.
 parse_usage_data() {
     u_ok=""; u_five_pct=""; u_five_reset_iso=""; u_seven_pct=""
     u_seven_reset_iso=""; u_extra_enabled="false"
@@ -157,7 +159,8 @@ parse_usage_data() {
         read -r u_extra_used
         read -r u_extra_limit
     } < <(printf '%s' "$1" | jq -r '
-        (if (.five_hour | type) == "object" then "ok" else "" end),
+        (if type == "object" and (has("five_hour") or has("seven_day"))
+         then "ok" else "" end),
         (.five_hour.utilization // 0 | round),
         (.five_hour.resets_at // ""),
         (.seven_day.utilization // 0 | round),
@@ -520,8 +523,9 @@ pick_window() {
     case "$b_reset" in ''|*[!0-9]*) b_reset=0 ;; esac
     case "$a_pct" in ''|*[!0-9]*) a_pct="" ;; esac
     case "$b_pct" in ''|*[!0-9]*) b_pct="" ;; esac
-    [ "$a_reset" -gt 0 ] && [ "$a_reset" -le "$now" ] && a_pct=""
-    [ "$b_reset" -gt 0 ] && [ "$b_reset" -le "$now" ] && b_pct=""
+    local expired=false
+    [ -n "$a_pct" ] && [ "$a_reset" -gt 0 ] && [ "$a_reset" -le "$now" ] && { a_pct=""; expired=true; }
+    [ -n "$b_pct" ] && [ "$b_reset" -gt 0 ] && [ "$b_reset" -le "$now" ] && { b_pct=""; expired=true; }
 
     win_pct="$a_pct"; win_reset="$a_reset"
     if [ -n "$b_pct" ]; then
@@ -533,6 +537,12 @@ pick_window() {
         [ "$win_reset" -gt 0 ] || win_reset="$b_reset"
     fi
     [ "$win_reset" -gt 0 ] || win_reset=""
+    # Every reading is from a window that has since reset. Claude Code drops
+    # the window from stdin at that moment and the cache can lag by up to
+    # cache_max_age, but a window that has reset has nothing used in it yet.
+    if [ -z "$win_pct" ] && $expired; then
+        win_pct=0; win_reset=""
+    fi
 }
 
 pick_window "$stdin_five_pct" "$stdin_five_reset" "$api_five_pct" "$api_five_reset"
