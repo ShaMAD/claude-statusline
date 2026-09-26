@@ -19,7 +19,39 @@ script on its own only when the main session has news, so without a timer the
 limits stand still while the session waits on subagents. The limits come from
 the usage endpoint as well as from Claude Code, since the endpoint counts
 every session and subagent on the account. It is asked at most once a minute,
-shared by all sessions.
+shared by all sessions: asked more often, it answers 429, and after a 429 no
+session asks again until its `Retry-After` has passed. Failed requests are
+logged to `~/.claude/statusline-usage-errors.log`.
+
+## Usage limit guard
+
+The installer also adds a `PreToolUse` hook, `~/.claude/hooks/limit-guard.sh`.
+Once the 5-hour usage reaches 95% or the weekly usage reaches 99%, it denies
+every tool call, in the main session and in subagents, and tells Claude to
+stop its agents, schedule a `CronCreate` job for one minute after the reset
+and tell you when work resumes. The resume time skips `:00` and `:30`, where
+one-shot jobs may fire up to 90 seconds early. Denied calls are logged to
+`~/.claude/limit-guard.log`.
+
+The guard reads the same usage cache and refreshes it itself when it is more
+than a minute old, so its reading is never older than that. A reading that is
+over ten minutes old, or whose window has already reset, never blocks.
+
+`/limits` shows the settings and the current usage, and changes them:
+
+```
+/limits                      show settings and usage
+/limits refresh 30           status line timer, 1-3600 s
+/limits guard on|off         turn the guard on or off
+/limits 5h 95 week 99        guard thresholds, 1-100 %
+```
+
+They live in `~/.claude/statusline.json` as `refresh_interval`,
+`limit_guard`, `limit_5h` and `limit_week`. `refresh_interval` is copied to
+`statusLine.refreshInterval` in `settings.json`, which is where Claude Code
+reads it. `"usage_log": true` also appends every usage reading to
+`~/.claude/usage-trend.tsv`, a line a minute, to study how fast the limits
+fill; it is off by default.
 
 ## Skills block
 

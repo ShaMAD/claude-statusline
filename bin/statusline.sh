@@ -138,41 +138,6 @@ load_skill_names() {
     skill_names=$(<"$skill_names_file")
 }
 
-# Same one-pass reasoning as the stdin read, for the usage API payload.
-# Returns non-zero when the payload is absent or carries neither window, which
-# also replaces the separate `jq -e` validity checks. A window that is present
-# but null reads as 0% with no reset time: between a reset and the first use
-# of the next window there is no window, and nothing has been used.
-parse_usage_data() {
-    u_ok=""; u_five_pct=""; u_five_reset_iso=""; u_seven_pct=""
-    u_seven_reset_iso=""; u_extra_enabled="false"
-    u_extra_pct=""; u_extra_used=""; u_extra_limit=""
-    [ -n "$1" ] || return 1
-    {
-        read -r u_ok
-        read -r u_five_pct
-        read -r u_five_reset_iso
-        read -r u_seven_pct
-        read -r u_seven_reset_iso
-        read -r u_extra_enabled
-        read -r u_extra_pct
-        read -r u_extra_used
-        read -r u_extra_limit
-    } < <(printf '%s' "$1" | jq -r '
-        (if type == "object" and (has("five_hour") or has("seven_day"))
-         then "ok" else "" end),
-        (.five_hour.utilization // 0 | round),
-        (.five_hour.resets_at // ""),
-        (.seven_day.utilization // 0 | round),
-        (.seven_day.resets_at // ""),
-        (.extra_usage.is_enabled // false),
-        (.extra_usage.utilization // 0 | round),
-        (.extra_usage.used_credits // 0 | round),
-        (.extra_usage.monthly_limit // 0 | round)
-    ' 2>/dev/null)
-    [ "$u_ok" = "ok" ]
-}
-
 # Keep first-invocation order, drop duplicates, and cap the list so a very
 # long session cannot grow the cache without bound.
 remember_skill() {
@@ -252,18 +217,44 @@ dirname=$(basename "$cwd")
 # form used by mpiton/claude-statusline, so a config written for either works.
 skills_enabled=false
 skills_limit=3
+# refresh_interval: seconds between timed reruns of this script (1-3600).
+# Claude Code reads it from statusLine.refreshInterval in settings.json, so
+# it is copied there when set here and different.
+cfg_refresh=""
 skills_config="$HOME/.claude/statusline.json"
 if [ -f "$skills_config" ]; then
     {
         read -r cfg_skills
         read -r cfg_limit
+        read -r cfg_refresh
     } < <(jq -r '
         (((.skills // false) == true) or ((.blocks // []) | index("skills") != null) | tostring),
-        (.skills_limit // 3 | if type == "number" and . >= 1 and . <= 10 then floor else 3 end)
+        (.skills_limit // 3 | if type == "number" and . >= 1 and . <= 10 then floor else 3 end),
+        (.refresh_interval // "" | if type == "number" and . >= 1 and . <= 3600 then floor else "" end)
     ' "$skills_config" 2>/dev/null)
     [ "$cfg_skills" = "true" ] && skills_enabled=true
     case "$cfg_limit" in ''|*[!0-9]*) : ;; *) skills_limit=$cfg_limit ;; esac
 fi
+
+settings_file="$HOME/.claude/settings.json"
+case "$cfg_refresh" in
+    ''|*[!0-9]*) : ;;
+    *)
+        if [ -f "$settings_file" ] && [ ! -L "$settings_file" ]; then
+            current_refresh=$(jq -r '.statusLine.refreshInterval // ""' "$settings_file" 2>/dev/null)
+            if [ "$current_refresh" != "$cfg_refresh" ] \
+                && jq -e '.statusLine | type == "object"' "$settings_file" >/dev/null 2>&1; then
+                # Written whole and renamed: a partial settings.json would
+                # disable every setting in it.
+                jq --argjson r "$cfg_refresh" '.statusLine.refreshInterval = $r' \
+                    "$settings_file" > "$settings_file.statusline.$$" 2>/dev/null \
+                    && [ -s "$settings_file.statusline.$$" ] \
+                    && mv -f "$settings_file.statusline.$$" "$settings_file"
+                rm -f "$settings_file.statusline.$$" 2>/dev/null
+            fi
+        fi
+        ;;
+esac
 
 skills_seen=""
 skill_names_loaded=false
@@ -429,80 +420,11 @@ if [ -n "$skills_seen" ]; then
 fi
 
 # ── Usage API (cached) ─────────────────────────────────
-# Queried even when stdin carries rate_limits. stdin is only as fresh as the
-# main conversation's last API response, so it stands still while subagents
-# or other sessions spend the same account. The endpoint reports the account
-# as a whole. The cache is shared by every session, so the endpoint is asked
-# at most once per cache_max_age however many sessions render.
-cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60
-
 usage_data=""
 extra_enabled="false"
 now=$(date +%s)
-needs_refresh=true
-
-if [ -f "$cache_file" ]; then
-    cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
-    case "$cache_mtime" in ''|*[!0-9]*) cache_mtime=0 ;; esac
-    if [ $(( now - cache_mtime )) -lt "$cache_max_age" ]; then
-        needs_refresh=false
-        usage_data=$(<"$cache_file")
-    fi
-fi
-
-if $needs_refresh; then
-    token=""
-    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-        token="$CLAUDE_CODE_OAUTH_TOKEN"
-    elif command -v security >/dev/null 2>&1; then
-        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-        if [ -n "$blob" ]; then
-            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-        fi
-    fi
-    if [ -z "$token" ] || [ "$token" = "null" ]; then
-        creds_file="${HOME}/.claude/.credentials.json"
-        if [ -f "$creds_file" ]; then
-            token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-        fi
-    fi
-    if [ -z "$token" ] || [ "$token" = "null" ]; then
-        if command -v secret-tool >/dev/null 2>&1; then
-            blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
-            if [ -n "$blob" ]; then
-                token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-            fi
-        fi
-    fi
-
-    if [ -n "$token" ] && [ "$token" != "null" ]; then
-        response=$(curl -s --max-time 5 \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $token" \
-            -H "anthropic-beta: oauth-2025-04-20" \
-            -H "User-Agent: claude-code/2.1.34" \
-            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-        if parse_usage_data "$response"; then
-            usage_data="$response"
-            # Written whole and renamed, so a session rendering at the same
-            # moment never reads a half-written file.
-            mkdir -p /tmp/claude 2>/dev/null
-            printf '%s\n' "$response" > "$cache_file.$$" 2>/dev/null \
-                && mv -f "$cache_file.$$" "$cache_file" 2>/dev/null
-        elif [ -f "$cache_file" ]; then
-            # A failed request is not retried on every render: each attempt
-            # can hold the render for the whole --max-time. Marking the old
-            # data fresh is safe, since it is only ever combined with stdin
-            # by taking the higher reading of a window that has not reset.
-            touch "$cache_file" 2>/dev/null
-        fi
-    fi
-    if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
-        usage_data=$(<"$cache_file")
-    fi
-fi
+# Installed next to this script; without it only stdin's readings are shown.
+[ -f "$HOME/.claude/usage-refresh.sh" ] && . "$HOME/.claude/usage-refresh.sh"
 
 api_five_pct=""; api_five_reset=""; api_seven_pct=""; api_seven_reset=""
 if parse_usage_data "$usage_data"; then
