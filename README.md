@@ -33,6 +33,12 @@ and tell you when work resumes. The resume time skips `:00` and `:30`, where
 one-shot jobs may fire up to 90 seconds early. Denied calls are logged to
 `~/.claude/limit-guard.log`.
 
+`/limits guard low` keeps the same thresholds but blocks nothing: the first
+tool call past a threshold in each session and reset window shows you a
+message suggesting `/low-priority`. Only you can switch that mode on; hooks
+cannot run slash commands. `ToolSearch` is never blocked, so Claude can load
+`CronCreate` when it is a deferred tool.
+
 The guard reads the same usage cache and refreshes it itself when it is more
 than a minute old, so its reading is never older than that. A reading that is
 over ten minutes old, or whose window has already reset, never blocks.
@@ -42,7 +48,7 @@ over ten minutes old, or whose window has already reset, never blocks.
 ```
 /limits                      show settings and usage
 /limits refresh 30           status line timer, 1-3600 s
-/limits guard on|off         turn the guard on or off
+/limits guard on|off|low     block, turn off, or only suggest /low-priority
 /limits 5h 95 week 99        guard thresholds, 1-100 %
 ```
 

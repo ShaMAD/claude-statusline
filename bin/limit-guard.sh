@@ -10,8 +10,10 @@
 #
 # Thresholds: "limit_5h" and "limit_week" in ~/.claude/statusline.json
 # (95 and 99 by default); set them with /limits.
-# Off: "limit_guard": false in ~/.claude/statusline.json (on by default),
-# or, as an emergency switch, touch /tmp/claude/limit-guard-off
+# Mode: "limit_guard" in ~/.claude/statusline.json. true (the default) blocks;
+# "low" blocks nothing and instead asks the user, once per session and reset
+# window, to run /low-priority, which only the user can switch on; false is
+# off. Emergency switch: touch /tmp/claude/limit-guard-off
 
 cache="/tmp/claude/statusline-usage-cache.json"
 max_age=600
@@ -28,7 +30,7 @@ if [ -f "$config" ]; then
         read -r cfg_five
         read -r cfg_seven
     } < <(jq -r '
-        (if .limit_guard == false then "off" else "on" end),
+        (if .limit_guard == false then "off" elif .limit_guard == "low" then "low" else "on" end),
         (.limit_5h // "" | if type == "number" and . >= 1 and . <= 100 then floor else "" end),
         (.limit_week // "" | if type == "number" and . >= 1 and . <= 100 then floor else "" end)
     ' "$config" 2>/dev/null)
@@ -39,8 +41,10 @@ fi
 
 tool=$(printf '%s' "$input" | jq -r '.tool_name // ""' 2>/dev/null)
 # The tools needed to carry out the instruction itself stay allowed.
+# ToolSearch among them: CronCreate may be a deferred tool whose schema has
+# to be loaded before it can be called.
 case "$tool" in
-    CronCreate|CronList|CronDelete|TaskStop|ScheduleWakeup|AskUserQuestion) exit 0 ;;
+    ToolSearch|CronCreate|CronList|CronDelete|TaskStop|ScheduleWakeup|AskUserQuestion) exit 0 ;;
 esac
 
 # Bring the cache up to date before judging it. Left to the status line, it
@@ -86,16 +90,33 @@ reason="USAGE LIMIT GUARD: $summary. Stop all work now.
 - If you are a subagent: do nothing else, end immediately and report that you stopped on the usage limit guard.
 - If you are the main session: stop running agents (TaskStop), then call CronCreate with cron \"$cron_expr\" (local time $resume_hm, one minute after the reset) and a prompt that resumes the interrupted task from where it stopped. Then tell the user, in Russian, that work is paused until $resume_hm and why. Make no other tool calls."
 
-# One line per denied call, to see afterwards which sessions and agents ran
-# into the guard and when: local time, levels, session, agent, cwd, tool.
+# One line per guarded call, to see afterwards which sessions and agents ran
+# into the guard and when: local time, mode, levels, session, agent, cwd, tool.
 guard_log="$HOME/.claude/limit-guard.log"
-printf '%s\n' "$input" | jq -r --arg t "$(date '+%F %T')" --arg s "$summary" --arg r "$resume_hm" '
-    [$t, $s, "resume " + $r, "session=" + (.session_id // "?"),
+log_guard() {
+printf '%s\n' "$input" | jq -r --arg t "$(date '+%F %T')" --arg m "$1" --arg s "$summary" --arg r "$resume_hm" '
+    [$t, $m, $s, "resume " + $r, "session=" + (.session_id // "?"),
      "agent=" + (.agent_type // .agent_id // "main"), "cwd=" + (.cwd // "?"), "tool=" + (.tool_name // "?")]
     | join("\t")' >> "$guard_log" 2>/dev/null
 if [ "$(wc -l < "$guard_log" 2>/dev/null)" -gt 5000 ] 2>/dev/null; then
     tail -n 2500 "$guard_log" > "$guard_log.$$" 2>/dev/null && mv -f "$guard_log.$$" "$guard_log"
 fi
+}
+
+# "low": the call goes ahead. The user is shown the notice once per session
+# and reset window; hooks cannot run slash commands, so /low-priority stays
+# the user's to type.
+if [ "$cfg_guard" = "low" ]; then
+    session=$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null | tr -dc 'A-Za-z0-9-')
+    marker="/tmp/claude/limit-guard-low/${session:-unknown}-$latest"
+    [ -f "$marker" ] && exit 0
+    mkdir -p /tmp/claude/limit-guard-low 2>/dev/null && : > "$marker"
+    log_guard "notify-low"
+    jq -n --arg m "Лимит использования: $summary. Работа продолжается. Чтобы не упереться в лимит, запустите /low-priority." '{systemMessage: $m}'
+    exit 0
+fi
+
+log_guard "deny"
 
 jq -n --arg r "$reason" '{
     hookSpecificOutput: {

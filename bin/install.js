@@ -27,15 +27,15 @@ function skillText() {
   const script = path.join(SKILL_DIR, "limits.sh");
   return `---
 name: limits
-description: Show or change the status line refresh interval and the usage-limit guard (on/off, 5h and weekly thresholds)
+description: Show or change the status line refresh interval and the usage-limit guard (on/off/low, 5h and weekly thresholds)
 disable-model-invocation: true
-argument-hint: "[refresh <sec>] [guard on|off] [5h <pct>] [week <pct>]"
+argument-hint: "[refresh <sec>] [guard on|off|low] [5h <pct>] [week <pct>]"
 allowed-tools: Bash(bash ${script}) Bash(bash ${script} *)
 ---
 
 !\`bash ${script} $ARGUMENTS 2>&1\`
 
-Report the output above to the user in two or three short lines. If it starts with "error:", say what was wrong and show the usage: \`/limits [refresh <sec>] [guard on|off] [5h <pct>] [week <pct>]\`. Run no tools.
+Report the output above to the user in two or three short lines. If it starts with "error:", say what was wrong and show the usage: \`/limits [refresh <sec>] [guard on|off|low] [5h <pct>] [week <pct>]\`. Run no tools.
 `;
 }
 
