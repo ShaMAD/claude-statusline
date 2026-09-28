@@ -10,10 +10,13 @@
 #
 # Thresholds: "limit_5h" and "limit_week" in ~/.claude/statusline.json
 # (95 and 99 by default); set them with /limits.
-# Mode: "limit_guard" in ~/.claude/statusline.json. true (the default) blocks;
-# "low" blocks nothing and instead asks the user, once per session and reset
-# window, to run /low-priority, which only the user can switch on; false is
-# off. Emergency switch: touch /tmp/claude/limit-guard-off
+# Off: "limit_guard": false in ~/.claude/statusline.json (on by default),
+# or, as an emergency switch, touch /tmp/claude/limit-guard-off
+# Lower priority: a session where the user ran /low-priority in the current
+# 5-hour window is not blocked. The transcript is the only place that records
+# it; only the success lines count as switched on. When a
+# session is blocked, the user is also told once per reset window that
+# /low-priority can keep it going.
 
 cache="/tmp/claude/statusline-usage-cache.json"
 max_age=600
@@ -30,7 +33,7 @@ if [ -f "$config" ]; then
         read -r cfg_five
         read -r cfg_seven
     } < <(jq -r '
-        (if .limit_guard == false then "off" elif .limit_guard == "low" then "low" else "on" end),
+        (if .limit_guard == false then "off" else "on" end),
         (.limit_5h // "" | if type == "number" and . >= 1 and . <= 100 then floor else "" end),
         (.limit_week // "" | if type == "number" and . >= 1 and . <= 100 then floor else "" end)
     ' "$config" 2>/dev/null)
@@ -103,25 +106,58 @@ if [ "$(wc -l < "$guard_log" 2>/dev/null)" -gt 5000 ] 2>/dev/null; then
 fi
 }
 
-# "low": the call goes ahead. The user is shown the notice once per session
-# and reset window; hooks cannot run slash commands, so /low-priority stays
-# the user's to type.
-if [ "$cfg_guard" = "low" ]; then
-    session=$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null | tr -dc 'A-Za-z0-9-')
-    marker="/tmp/claude/limit-guard-low/${session:-unknown}-$latest"
-    [ -f "$marker" ] && exit 0
-    mkdir -p /tmp/claude/limit-guard-low 2>/dev/null && : > "$marker"
-    log_guard "notify-low"
-    jq -n --arg m "Лимит использования: $summary. Работа продолжается. Чтобы не упереться в лимит, запустите /low-priority." '{systemMessage: $m}'
-    exit 0
+session=$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null | tr -dc 'A-Za-z0-9-')
+marker_dir=/tmp/claude/limit-guard-low
+mkdir -p "$marker_dir" 2>/dev/null
+
+# /low-priority is a local command, so it shows up in the transcript as a
+# system line with commandRun.command. Only a run since the current 5-hour
+# window began counts: lower priority lasts until the reset. Only the last
+# run matters, and only the two success lines count ("Continuing now at lower
+# priority ..." and "Lower-priority mode is back on ..."): "isn't available",
+# the spent-allowance and "taking a break" refusals, and "is off" after a
+# stop all mean the mode is not running. Wording from the 2.1.269 binary,
+# https://www.thinkfacility.com/errors/lower-priority-mode-isnt-available-right-now/
+transcript=$(printf '%s' "$input" | jq -r '.transcript_path // ""' 2>/dev/null)
+if [ -f "$transcript" ]; then
+    window_start=$(jq -r --argjson now "$now" '
+        def epoch: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601;
+        if (.five_hour.resets_at | type) == "string" then (.five_hour.resets_at | epoch) - 18000 else $now - 18000 end
+    ' "$cache" 2>/dev/null)
+    case "$window_start" in ''|*[!0-9]*) window_start=$(( now - 18000 )) ;; esac
+    lowprio=$(grep -F '"command":"low-priority"' "$transcript" 2>/dev/null | tail -n 1 | jq -r --argjson ws "$window_start" '
+        select(.subtype == "local_command" and ((.content // "") | test("Continuing now at lower priority|Lower-priority mode is back on")))
+        | (.timestamp // "" | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0)
+        | select(. >= $ws)
+    ' 2>/dev/null)
+    if [ -n "$lowprio" ]; then
+        marker="$marker_dir/${session:-unknown}-$latest-skip"
+        [ -f "$marker" ] || { : > "$marker"; log_guard "lowprio-skip"; }
+        exit 0
+    fi
+fi
+
+# Tell the user once per session and reset window; hooks cannot run slash
+# commands, so /low-priority stays the user's to type. Only the main agent
+# gets it: a subagent's systemMessage never reaches the chat, yet it used up
+# the marker. Subagent calls carry agent_id (agent_type alone is also set for
+# a main session started with --agent). The reset time jitters by a second
+# or two across refreshes (20:09:59 vs 20:10:00), so the marker key is the
+# reset rounded to 5 minutes.
+notice=""
+is_sub=$(printf '%s' "$input" | jq -r 'if (.agent_id // "") != "" then 1 else "" end' 2>/dev/null)
+marker="$marker_dir/${session:-unknown}-$(( (latest + 150) / 300 * 300 ))"
+if [ -z "$is_sub" ] && [ ! -f "$marker" ]; then
+    : > "$marker"
+    notice="Лимит использования: $summary. Работа остановлена до $resume_hm. Можете попробовать продолжить сейчас через /low-priority (доступен не всем аккаунтам)."
 fi
 
 log_guard "deny"
 
-jq -n --arg r "$reason" '{
+jq -n --arg r "$reason" --arg m "$notice" '{
     hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
         permissionDecisionReason: $r
     }
-}'
+} + (if $m == "" then {} else {systemMessage: $m} end)'

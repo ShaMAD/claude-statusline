@@ -4,8 +4,7 @@
 #
 #   limits.sh                 show settings and current usage
 #   limits.sh refresh <sec>   status line timer, 1-3600 (copied to settings.json)
-#   limits.sh guard on|off|low  usage-limit guard; low suggests /low-priority
-#                             instead of blocking
+#   limits.sh guard on|off    usage-limit guard
 #   limits.sh 5h <pct>        guard threshold for the 5-hour window, 1-100
 #   limits.sh week <pct>      guard threshold for the weekly window, 1-100
 #
@@ -49,8 +48,7 @@ while [ $# -gt 0 ]; do
             case "$value" in
                 on) write_json "$config" '.limit_guard = true' ;;
                 off) write_json "$config" '.limit_guard = false' ;;
-                low) write_json "$config" '.limit_guard = "low"' ;;
-                *) die "guard takes on, off or low" ;;
+                *) die "guard takes on or off" ;;
             esac
             ;;
         5h)
@@ -68,7 +66,7 @@ done
 
 jq -r '
     "refresh:    \(.refresh_interval // 30)s",
-    "guard:      \(if .limit_guard == false then "off" elif .limit_guard == "low" then "low (no blocking, suggests /low-priority)" else "on" end)",
+    "guard:      \(if .limit_guard == false then "off" else "on" end)",
     "5h limit:   \(.limit_5h // 95)%",
     "week limit: \(.limit_week // 99)%"
 ' "$config"
