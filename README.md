@@ -14,6 +14,8 @@ npx @kamranahmedse/claude-statusline
 
 It backups your old status line if any and copies the status line script to `~/.claude/statusline.sh` and configures your Claude Code settings.
 
+On Linux it also shows a `cpu` / `mem` line with the load of the whole machine, read from `/proc`. CPU is averaged between two refreshes, so it shows `—` on the first one; swap is added when 10% or more is in use. On macOS the line is hidden.
+
 ## Requirements
 
 - [jq](https://jqlang.github.io/jq/) — for parsing JSON

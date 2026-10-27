@@ -328,8 +328,161 @@ if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
     rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
 fi
 
+# ── System load line (cpu / mem) ────────────────────────
+# Linux only: read from /proc, hidden when /proc/stat and /proc/meminfo are
+# missing (e.g. macOS). CPU is the average between two renders, so the
+# previous /proc/stat reading is kept per session in /tmp/claude.
+color_for_load() {
+    local pct=$1
+    if [ "$pct" -ge 95 ]; then printf "$red"
+    elif [ "$pct" -ge 85 ]; then printf "$yellow"
+    elif [ "$pct" -ge 70 ]; then printf "$orange"
+    else printf "$green"
+    fi
+}
+
+build_load_bar() {
+    local pct=$1
+    local width=$2
+    [ "$pct" -lt 0 ] 2>/dev/null && pct=0
+    [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar_color
+    bar_color=$(color_for_load "$pct")
+
+    local filled_str="" empty_str=""
+    for ((i=0; i<filled; i++)); do filled_str+="●"; done
+    for ((i=0; i<empty; i++)); do empty_str+="○"; done
+
+    printf "${bar_color}${filled_str}${dim}${empty_str}${reset}"
+}
+
+# Plain decimal: no sign, no leading zero, at most 18 digits
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*|0?*|???????????????????*) return 1 ;;
+    esac
+    return 0
+}
+
+sys_line=""
+proc_root="${STATUSLINE_PROC:-/proc}"
+
+cpu_part=""
+if [ -f "$proc_root/stat" ]; then
+    cpu_total=""
+    { read -r s_label s_user s_nice s_sys s_idle s_iowait s_irq s_softirq s_steal _ < "$proc_root/stat"; } 2>/dev/null
+    is_uint "$s_iowait" || s_iowait=0
+    is_uint "$s_irq" || s_irq=0
+    is_uint "$s_softirq" || s_softirq=0
+    is_uint "$s_steal" || s_steal=0
+    if [ "$s_label" = "cpu" ] && is_uint "$s_user" && is_uint "$s_nice" \
+        && is_uint "$s_sys" && is_uint "$s_idle"; then
+        cpu_idle=$(( s_idle + s_iowait ))
+        cpu_total=$(( s_user + s_nice + s_sys + cpu_idle + s_irq + s_softirq + s_steal ))
+    fi
+
+    if [ -n "$cpu_total" ]; then
+        session_id=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)
+        case "$session_id" in
+            ''|*[!A-Za-z0-9._-]*|.*) session_id="unknown" ;;
+        esac
+        sys_cache="/tmp/claude/sysstats-${session_id}"
+
+        prev_total=""
+        prev_idle=""
+        if [ -f "$sys_cache" ] && [ ! -L "$sys_cache" ]; then
+            { read -r prev_total prev_idle _ < "$sys_cache"; } 2>/dev/null
+        fi
+
+        cpu_pct=""
+        if is_uint "$prev_total" && is_uint "$prev_idle" \
+            && [ "$cpu_total" -gt "$prev_total" ] && [ "$cpu_idle" -ge "$prev_idle" ]; then
+            d_total=$(( cpu_total - prev_total ))
+            d_busy=$(( d_total - (cpu_idle - prev_idle) ))
+            [ "$d_busy" -lt 0 ] && d_busy=0
+            cpu_pct=$(( (d_busy * 200 / d_total + 1) / 2 ))
+            [ "$cpu_pct" -gt 100 ] && cpu_pct=100
+        fi
+
+        # Written to a fresh temp file and renamed, as renders can overlap
+        if [ -d /tmp/claude ] && [ ! -L /tmp/claude ] && [ ! -L "$sys_cache" ]; then
+            sys_tmp=$(mktemp /tmp/claude/sysstats.XXXXXX 2>/dev/null)
+            if [ -n "$sys_tmp" ]; then
+                if printf '%s %s\n' "$cpu_total" "$cpu_idle" > "$sys_tmp" 2>/dev/null; then
+                    mv -f "$sys_tmp" "$sys_cache" 2>/dev/null
+                fi
+                [ -e "$sys_tmp" ] && rm -f "$sys_tmp" 2>/dev/null
+            fi
+        fi
+
+        if [ -n "$cpu_pct" ]; then
+            cpu_bar=$(build_load_bar "$cpu_pct" "$bar_width")
+            cpu_color=$(color_for_load "$cpu_pct")
+            cpu_pct_fmt=$(printf "%3d" "$cpu_pct")
+            cpu_part="${white}cpu${reset}     ${cpu_bar} ${cpu_color}${cpu_pct_fmt}%${reset}"
+        else
+            empty_bar=""
+            for ((i=0; i<bar_width; i++)); do empty_bar+="○"; done
+            cpu_part="${white}cpu${reset}     ${dim}${empty_bar}${reset}   ${dim}—${reset}"
+        fi
+    fi
+fi
+
+# Memory in use is MemTotal - MemAvailable; swap is shown from 10% up
+mem_part=""
+if [ -f "$proc_root/meminfo" ]; then
+    m_total=""
+    m_avail=""
+    m_swap_total=""
+    m_swap_free=""
+    {
+        while read -r k v _; do
+            case "$k" in
+                MemTotal:) m_total=$v ;;
+                MemAvailable:) m_avail=$v ;;
+                SwapTotal:) m_swap_total=$v ;;
+                SwapFree:) m_swap_free=$v ;;
+            esac
+        done < "$proc_root/meminfo"
+    } 2>/dev/null
+    if is_uint "$m_total" && is_uint "$m_avail" && [ "$m_total" -gt 0 ]; then
+        m_used=$(( m_total - m_avail ))
+        [ "$m_used" -lt 0 ] && m_used=0
+        mem_pct=$(( (m_used * 200 / m_total + 1) / 2 ))
+        [ "$mem_pct" -gt 100 ] && mem_pct=100
+        mem_bar=$(build_load_bar "$mem_pct" "$bar_width")
+        mem_color=$(color_for_load "$mem_pct")
+        mem_pct_fmt=$(printf "%3d" "$mem_pct")
+        mem_part="${white}mem${reset} ${mem_bar} ${mem_color}${mem_pct_fmt}%${reset}"
+        if is_uint "$m_swap_total" && is_uint "$m_swap_free" && [ "$m_swap_total" -gt 0 ]; then
+            swap_used=$(( m_swap_total - m_swap_free ))
+            [ "$swap_used" -lt 0 ] && swap_used=0
+            swap_pct=$(( (swap_used * 200 / m_swap_total + 1) / 2 ))
+            [ "$swap_pct" -gt 100 ] && swap_pct=100
+            if [ "$swap_pct" -ge 10 ]; then
+                swap_color=$(color_for_load "$swap_pct")
+                mem_part+=" ${white}swap${reset} ${swap_color}${swap_pct}%${reset}"
+            fi
+        fi
+    fi
+fi
+
+if [ -n "$cpu_part" ] && [ -n "$mem_part" ]; then
+    sys_line="${cpu_part}   ${mem_part}"
+else
+    sys_line="${cpu_part}${mem_part}"
+fi
+
 # ── Output ──────────────────────────────────────────────
 printf "%b" "$line1"
-[ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"
+bottom_lines="$rate_lines"
+if [ -n "$sys_line" ]; then
+    [ -n "$bottom_lines" ] && bottom_lines+="\n"
+    bottom_lines+="$sys_line"
+fi
+[ -n "$bottom_lines" ] && printf "\n\n%b" "$bottom_lines"
 
 exit 0
