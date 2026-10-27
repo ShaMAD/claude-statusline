@@ -129,13 +129,25 @@ load_skill_names() {
         return 0
     fi
 
-    {
+    skill_names=$({
         find "$HOME/.claude/skills" "$cwd/.claude/skills" -maxdepth 2 -name "SKILL.md" 2>/dev/null
         find "$HOME/.claude/commands" "$cwd/.claude/commands" -maxdepth 2 -name "*.md" 2>/dev/null
         find "$HOME/.claude/plugins" -maxdepth 8 \
              \( -name "SKILL.md" -o -path "*/commands/*.md" \) 2>/dev/null
-    } | sed 's|/SKILL\.md$||; s|\.md$||; s|.*/||' | sort -u > "$skill_names_file" 2>/dev/null
-    skill_names=$(<"$skill_names_file")
+    } | sed 's|/SKILL\.md$||; s|\.md$||; s|.*/||' | sort -u)
+
+    # Written to a private temp file and renamed into place, so a symlink
+    # planted at the cache path between the check and the write is never
+    # followed. No temp file, no cache write; the names are still used.
+    local names_tmp
+    if [ -d /tmp/claude ] && [ ! -L /tmp/claude ] && [ ! -L "$skill_names_file" ]; then
+        names_tmp=$(mktemp "$skill_names_file.XXXXXX" 2>/dev/null)
+        if [ -n "$names_tmp" ]; then
+            printf '%s\n' "$skill_names" > "$names_tmp" 2>/dev/null \
+                && mv -f "$names_tmp" "$skill_names_file" 2>/dev/null
+            [ -e "$names_tmp" ] && rm -f "$names_tmp" 2>/dev/null
+        fi
+    fi
 }
 
 # Same one-pass reasoning as the stdin read, for the usage API payload.
@@ -353,8 +365,14 @@ if $skills_enabled && [ -n "$transcript" ] && [ -f "$transcript" ]; then
                 }
             ')
 
-        if [ ! -L "$skills_cache" ]; then
-            printf '%s\t%s\n' "$skills_offset" "$skills_seen" > "$skills_cache" 2>/dev/null
+        # Same mktemp-and-rename write as the skill-names cache.
+        if [ -d /tmp/claude ] && [ ! -L /tmp/claude ] && [ ! -L "$skills_cache" ]; then
+            skills_tmp=$(mktemp "$skills_cache.XXXXXX" 2>/dev/null)
+            if [ -n "$skills_tmp" ]; then
+                printf '%s\t%s\n' "$skills_offset" "$skills_seen" > "$skills_tmp" 2>/dev/null \
+                    && mv -f "$skills_tmp" "$skills_cache" 2>/dev/null
+                [ -e "$skills_tmp" ] && rm -f "$skills_tmp" 2>/dev/null
+            fi
         fi
     fi
 fi
